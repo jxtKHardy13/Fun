@@ -1,6 +1,8 @@
 import json
 import logging
 import asyncio
+import aiohttp  # Added missing import
+import websockets  # Added missing import
 from typing import Any, Dict, List, Optional
 import base58
 from bip_utils import Bip39SeedGenerator, Bip44, Bip44Coins
