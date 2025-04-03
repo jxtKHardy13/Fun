@@ -1,0 +1,7 @@
+python-telegram-bot
+aiohttp
+websockets
+bip-utils  # New dependency for BIP-44 derivation
+solders
+solana
+base58
