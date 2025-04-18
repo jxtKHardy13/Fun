@@ -1,7 +1,14 @@
-python-telegram-bot
 aiohttp
-websockets
-bip-utils  # New dependency for BIP-44 derivation
+aiodns
+aiodns-socks
+async-timeout
+base58
+bip-utils
+cryptography
+jsonschema
+pydantic
+python-telegram-bot
 solders
 solana
-base58
+sqlite3
+websockets
