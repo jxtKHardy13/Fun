@@ -2,6 +2,7 @@ import json
 import logging
 import asyncio
 import sqlite3
+import time
 from typing import Any, Dict, List, Optional
 import base58
 import aiohttp
@@ -144,20 +145,78 @@ def load_wallet(user_id: int) -> Optional[Keypair]:
 # =============================================================================
 # 7. HELPER FUNCTIONS
 # =============================================================================
-async def get_sol_price() -> float:
-    """Fetch SOL price from CoinGecko asynchronously."""
-    async with aiohttp.ClientSession() as session:
+async def get_sol_price() -> Optional[float]:
+    """Fetch SOL price from CoinGecko or Binance with caching and retries."""
+    # Check cache
+    cache_key = "sol_price"
+    cache_timeout = 60  # Cache for 60 seconds
+    if cache_key in user_settings.get(0, {}):
+        cached_price, timestamp = user_settings[0][cache_key]
+        if time.time() - timestamp < cache_timeout:
+            return cached_price
+
+    async def fetch_coingecko():
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(
+                    COINGECKO_URL,
+                    params={"ids": "solana", "vs_currencies": "usd"},
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as resp:
+                    if resp.status == 429:
+                        raise aiohttp.ClientResponseError(
+                            resp.request_info, resp.history, status=429, message="Rate limit exceeded"
+                        )
+                    data = await resp.json()
+                    price = float(data.get("solana", {}).get("usd", 0))
+                    return price if 1 <= price <= 1000 else None
+            except (aiohttp.ClientError, ValueError) as e:
+                logger.error(f"CoinGecko error: {e}")
+                return None
+
+    async def fetch_binance():
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(
+                    "https://api.binance.com/api/v3/ticker/price",
+                    params={"symbol": "SOLUSDT"},
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as resp:
+                    if resp.status == 429:
+                        raise aiohttp.ClientResponseError(
+                            resp.request_info, resp.history, status=429, message="Rate limit exceeded"
+                        )
+                    data = await resp.json()
+                    price = float(data.get("price", 0))
+                    return price if 1 <= price <= 1000 else None
+            except (aiohttp.ClientError, ValueError) as e:
+                logger.error(f"Binance error: {e}")
+                return None
+
+    # Retry logic
+    for attempt in range(3):
         try:
-            async with session.get(
-                COINGECKO_URL,
-                params={"ids": "solana", "vs_currencies": "usd"},
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
-                data = await resp.json()
-                return float(data.get("solana", {}).get("usd", 0))
-        except aiohttp.ClientError as e:
-            logger.error(f"Error fetching SOL price: {e}")
-            return 0.0
+            price = await fetch_coingecko()
+            if price is not None:
+                async with orders_lock:
+                    user_settings.setdefault(0, {})[cache_key] = (price, time.time())
+                return price
+            price = await fetch_binance()
+            if price is not None:
+                async with orders_lock:
+                    user_settings.setdefault(0, {})[cache_key] = (price, time.time())
+                return price
+        except aiohttp.ClientResponseError as e:
+            if e.status == 429:
+                await asyncio.sleep(2 ** (attempt + 2))  # Longer delay for rate limits
+            else:
+                await asyncio.sleep(2 ** attempt)
+        except Exception as e:
+            logger.error(f"Price fetch attempt {attempt + 1} failed: {e}")
+            await asyncio.sleep(2 ** attempt)
+
+    logger.warning("All attempts to fetch SOL price failed")
+    return None
 
 async def fetch_pool_id(token_address: str) -> Optional[str]:
     """Fetch Raydium pool ID dynamically for a given token."""
@@ -321,9 +380,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 balance = 0
                 wallet_info = f"💳 Your Wallet\n      ↳ {wallet.public_key}\n      ↳ Balance: Error"
 
+    price_display = f"💰 SOL Price: ${sol_price:.2f}" if sol_price is not None else "💰 SOL Price: Unavailable"
     message = (
         f"💊 Welcome to PumpFunPro! 🔫\n\n"
-        f"💰 SOL Price: ${sol_price:.2f}\n\n"
+        f"{price_display}\n\n"
         f"{wallet_info}\n\n"
         "Your ultimate Solana trading assistant."
     )
@@ -359,12 +419,12 @@ async def buysell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("🔄 Enter token address and amount (e.g., TOKEN_ADDRESS, 1.0):")
     async with orders_lock:
         pending_orders[user_id] = {"action": "trade", "step": "details"}
+    asyncio.create_task(clear_pending_order(user_id))
 
 async def sniper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Display sniper mode options."""
     keyboard = [
-        [InlineKeyboardButton("🔫 Pump.fun", callback_data="sniperpump"),
-         InlineKeyboardButton("🌕 Moonshot", callback_data="snipermoonshot")],
+        [InlineKeyboardButton("🔫 Pump.fun", callback_data="sniperpump")],
         [InlineKeyboardButton("📜 List Snipers", callback_data="listallsniperpump")]
     ]
     await update.message.reply_text("🎯 Choose sniper mode:", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -451,6 +511,7 @@ async def copytrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("👥 Enter trader's address to copy:")
     async with orders_lock:
         pending_orders[user_id] = {"action": "copytrade", "step": "address"}
+    asyncio.create_task(clear_pending_order(user_id))
 
 async def monitor_trader(user_id: int, trader_address: str) -> None:
     """Monitor and copy trader's transactions (placeholder)."""
@@ -564,33 +625,57 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     data = update.callback_query.data
     user_id = update.callback_query.from_user.id
 
+    async with orders_lock:
+        user_settings.setdefault(user_id, {})
+
     handlers = {
-        "wallet": lambda: context.bot.send_message(chat_id=user_id, text="💼 Send wallet details (mnemonic/private key):"),
+        "wallet": lambda: wallet_prompt(update, context),
         "start_trading": lambda: buysell(update, context),
         "portfolio": lambda: profile(update, context),
         "settings": lambda: settings(update, context),
         "help": lambda: help_handler(update, context),
         "sniperpump": lambda: sniperpump(update, context),
         "listallsniperpump": lambda: listallsniperpump(update, context),
-        "snipermoonshot": lambda: update.callback_query.answer("🌕 Moonshot mode not implemented yet", show_alert=True),
-        "autobuy": lambda: update.callback_query.answer("✅ Auto Buy toggled", show_alert=True),
-        "autosell": lambda: update.callback_query.answer("✅ Auto Sell toggled", show_alert=True),
-        "slippage": lambda: update.callback_query.answer("✅ Slippage set to 0.5%", show_alert=True),
-        "create_limit": lambda: context.bot.send_message(chat_id=user_id, text="📈 Send: TOKEN, PRICE, QUANTITY"),
-        "modify_limit": lambda: context.bot.send_message(chat_id=user_id, text="✏ Send: TOKEN, PRICE, QUANTITY"),
+        "create_limit": lambda: context.bot.send_message(
+            chat_id=user_id,
+            text="📈 Send: TOKEN, PRICE, QUANTITY"
+        ),
+        "modify_limit": lambda: context.bot.send_message(
+            chat_id=user_id,
+            text="✏ Send: TOKEN, PRICE, QUANTITY"
+        ),
     }
+
     if data in handlers:
         await handlers[data]()
+        if data in ["create_limit", "modify_limit", "slippage"]:
+            async with orders_lock:
+                pending_orders[user_id] = {"action": data}
+            asyncio.create_task(clear_pending_order(user_id))
         await update.callback_query.answer()
+    elif data == "autobuy":
+        async with orders_lock:
+            user_settings[user_id]["autobuy"] = not user_settings[user_id].get("autobuy", False)
+        await update.callback_query.answer(
+            f"Auto Buy {'enabled' if user_settings[user_id]['autobuy'] else 'disabled'}"
+        )
+    elif data == "autosell":
+        async with orders_lock:
+            user_settings[user_id]["autosell"] = not user_settings[user_id].get("autosell", False)
+        await update.callback_query.answer(
+            f"Auto Sell {'enabled' if user_settings[user_id]['autosell'] else 'disabled'}"
+        )
+    elif data == "slippage":
+        await context.bot.send_message(chat_id=user_id, text="📉 Enter slippage percentage (e.g., 0.5):")
+        async with orders_lock:
+            pending_orders[user_id] = {"action": "set_slippage"}
+        await update.callback_query.answer()
+        asyncio.create_task(clear_pending_order(user_id))
     elif data.startswith("lang_"):
         lang = data.split("_")[1]
         async with orders_lock:
-            user_settings.setdefault(user_id, {})["language"] = lang
+            user_settings[user_id]["language"] = lang
         await update.callback_query.answer(f"Language set to {lang}")
-
-    if data in ["wallet", "create_limit", "modify_limit"]:
-        async with orders_lock:
-            pending_orders[user_id] = {"action": data}
 
 # =============================================================================
 # 10. PENDING INPUT HANDLER
@@ -654,6 +739,22 @@ async def pending_input_handler(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as e:
             logger.error(f"Limit order error for user {user_id}: {e}\n{traceback.format_exc()}")
             await update.message.reply_text(f"❌ Error: {e}")
+    elif order["action"] == "set_slippage":
+        try:
+            slippage = float(text)
+            if slippage < 0:
+                await update.message.reply_text("❌ Slippage must be non-negative")
+                return
+            async with orders_lock:
+                user_settings[user_id]["slippage"] = slippage
+                if user_id in pending_orders:
+                    del pending_orders[user_id]
+            await update.message.reply_text(f"✅ Slippage set to {slippage}%")
+        except ValueError:
+            await update.message.reply_text("❌ Invalid slippage format. Use a number (e.g., 0.5)")
+        except Exception as e:
+            logger.error(f"Slippage setting error for user {user_id}: {e}\n{traceback.format_exc()}")
+            await update.message.reply_text(f"❌ Error: {e}")
     elif order["action"] == "copytrade":
         try:
             trader_address = text
@@ -707,7 +808,18 @@ async def monitor_pump_launches() -> None:
             reconnect_delay = min(reconnect_delay * 1.5, 60)
 
 # =============================================================================
-# 12. MAIN APPLICATION SETUP
+# 12. UTILITY FUNCTIONS
+# =============================================================================
+async def clear_pending_order(user_id: int, delay: int = 300) -> None:
+    """Clear pending order after a timeout."""
+    await asyncio.sleep(delay)
+    async with orders_lock:
+        if user_id in pending_orders:
+            del pending_orders[user_id]
+            logger.info(f"Cleared pending order for user {user_id} due to timeout")
+
+# =============================================================================
+# 13. MAIN APPLICATION SETUP
 # =============================================================================
 application = None
 
