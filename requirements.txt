@@ -1,30 +1,30 @@
 # Core Dependencies
-python-telegram-bot==20.3
-aiohttp==3.9.3
-websockets==12.0
+python-telegram-bot
+aiohttp
+websockets
 
 # Solana Ecosystem
-solders==0.18.0
-solana==0.30.0
-base58==2.1.1  # Replaced pybase58 with the more maintained base58
+solders
+solana
+base58  # Replaced pybase58 with the more maintained base58
 
 # Cryptography
-cryptography==42.0.4
-bip-utils==2.7.0
+cryptography
+bip-utils
 
 # Database
-aiosqlite==0.19.0
+aiosqlite
 
 # Utilities
-python-dotenv==1.0.0
-cachetools==5.3.2
-ujson==5.8.0
+python-dotenv
+cachetools
+ujson
 
 # Async (Python 3.11+ doesn't need separate asyncio package)
 # Removed: asyncio==3.4.3 (built into Python 3.11+)
 
 # Development (optional)
-pytest==7.4.4
-pytest-asyncio==0.23.5
-black==23.12.1
-mypy==1.8.0
+pytest
+pytest-asyncio
+black
+mypy
