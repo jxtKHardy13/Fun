@@ -25,14 +25,11 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from aiohttp import web
 
 # =============================================================================
 # 1. CONFIGURATION
 # =============================================================================
 TELEGRAM_TOKEN = "7594787474:AAFj8_wxiZXGcpNfFB2C77jBLQu9U0DP2A0"  # Replace with your Telegram bot token from @BotFather
-PORT = 8443
-WEBHOOK_URL = "https://your-ngrok-id.ngrok-free.app:8443/webhook"  # Replace with ngrok or production URL
 RPC_URL = "https://api.mainnet-beta.solana.com"
 COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
 RAYDIUM_API_URL = "https://api-v3.raydium.io/pools/info/mint"
@@ -181,18 +178,17 @@ async def generate_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             store_wallet(user_id, keypair)
 
         message = (
-            f"🎉 Congratulations! Your new Solana wallet has been generated!\n\n"
+            f"🎉 New Solana wallet generated!\n\n"
             f"**Wallet Address**: `{keypair.public_key}`\n"
             f"**Mnemonic Phrase**: `{mnemonic}`\n"
             f"**Private Key**: `{private_key}`\n\n"
-            f"⚠️ **SECURITY WARNING**: Save these details securely and never share them publicly! "
-            f"Store your mnemonic and private key offline."
+            f"⚠️ **SECURITY WARNING**: Save these securely and never share publicly!"
         )
         await context.bot.send_message(chat_id=user_id, text=message, parse_mode="Markdown")
         logger.info(f"Wallet generated for user {user_id}: {keypair.public_key}")
     except Exception as e:
         logger.error(f"Error generating wallet for user {user_id}: {e}\n{traceback.format_exc()}")
-        await context.bot.send_message(chat_id=user_id, text="❌ Error generating wallet. Please try again.")
+        await context.bot.send_message(chat_id=user_id, text="❌ Error generating wallet.")
 
 # =============================================================================
 # 8. HELPER FUNCTIONS
@@ -308,7 +304,7 @@ async def execute_trade(user_id: int, token_address: str, amount: float, action:
             slippage = user_settings.get(user_id, {}).get("slippage", 0.5)
         logger.info(f"Applying slippage: {slippage}% for {action} trade")
 
-        logger.info(f"Simulated {action} of {amount} SOL for token {token_address} on pool {pool_id} with {slippage}% slippage")
+        logger.info(f"Simulated {action} of {amount} SOL for token {token_address} on pool {pool_id}")
         async with orders_lock:
             trade_data = f"{action.upper()} {amount} SOL for {token_address} (slippage: {slippage}%)"
             trades.setdefault(user_id, []).append(trade_data)
@@ -330,7 +326,7 @@ async def process_wallet_key(update: Update, context: ContextTypes.DEFAULT_TYPE)
     text = update.message.text.strip()
 
     if connection_attempts.get(user_id, 0) >= 3:
-        await update.message.reply_text("❌ Too many attempts. Please try again later.")
+        await update.message.reply_text("❌ Too many attempts. Try again later.")
         return
 
     connection_attempts[user_id] = connection_attempts.get(user_id, 0) + 1
@@ -366,7 +362,7 @@ async def process_wallet_key(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     elif len(key_bytes) == 32:
                         keypair = Keypair.from_seed(key_bytes)
                     else:
-                        await update.message.reply_text("❌ Invalid key length. Must be 32 or 64 bytes.")
+                        await update.message.reply_text("❌ Invalid key length.")
                         return
                 except Exception as e:
                     logger.error(f"Private key processing error for user {user_id}: {e}")
@@ -871,36 +867,7 @@ async def clear_pending_order(user_id: int, delay: int = 300) -> None:
             logger.info(f"Cleared pending order for user {user_id} due to timeout")
 
 # =============================================================================
-# 14. WEBHOOK SERVER
-# =============================================================================
-async def webhook_handler(request: web.Request):
-    try:
-        update = Update.de_json(await request.json(), application.bot)
-        if update:
-            await application.process_update(update)
-        return web.Response(status=200)
-    except Exception as e:
-        logger.error(f"Webhook error: {e}\n{traceback.format_exc()}")
-        return web.Response(status=500)
-
-async def setup_webhook():
-    try:
-        await application.bot.set_webhook(url=WEBHOOK_URL)
-        logger.info(f"Webhook set to {WEBHOOK_URL}")
-    except Exception as e:
-        logger.error(f"Error setting webhook: {e}")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_post('/webhook', webhook_handler)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    logger.info(f"Web server started on port {PORT}")
-
-# =============================================================================
-# 15. MAIN APPLICATION SETUP
+# 14. MAIN APPLICATION SETUP
 # =============================================================================
 def main():
     global application
@@ -934,15 +901,11 @@ def main():
 
     loop = asyncio.get_event_loop()
     loop.create_task(monitor_pump_launches())
-    loop.create_task(setup_webhook())
-    loop.create_task(start_web_server())
 
     def handle_shutdown():
         tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
         for task in tasks:
             task.cancel()
-        loop.run_until_complete(application.bot.delete_webhook())
-        loop.stop()
         loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()
 
@@ -950,8 +913,8 @@ def main():
         loop.add_signal_handler(sig, handle_shutdown)
 
     try:
-        logger.info("Bot started with webhook")
-        loop.run_forever()
+        logger.info("Bot started with long polling")
+        application.run_polling()
     except KeyboardInterrupt:
         handle_shutdown()
     except Exception as e:
